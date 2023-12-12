@@ -4,7 +4,6 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <omp.h>
 #include <time.h>
 
 
@@ -20,23 +19,27 @@
 
 void data_to_file(double*, int, int);
 void config_plot(int, int, int);
+__global__ void calculate_new_step(double*, double*, const int, int);
 
 // Аргументы ком. строки - исп. ф., кол-во элементов сетки, время моделирования
 int main(int argc, char* argv[]){
-	int M;
-	int N;
+	int M, M_gpu;
+	int N, N_gpu;
 	double modeling_time;
 	int i, j;
 	double *matrix_1, *matrix_2; // две матрицы для старого и нового временных слоёв
 	double cur_time = 0; // прошедшее время эксперимента
 	FILE *fp;
-	double *new_layer, *old, *tmp, *sending_new;
+	double *new_layer, *old, *tmp;
+	double *new_layer_gpu, *old_gpu;
 	double my_perfect_const = TIME_STEP / (R * C);
-	int myrank, total;
-	int rows_per_proc;
 	int bot_row, top_row;
 
+	cudaEvent_t start, stop;
+	float GPUTime = 0.0f;
 
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
 
 
 	printf("my_perfect_const %f\n", my_perfect_const);
@@ -47,9 +50,15 @@ int main(int argc, char* argv[]){
 	}
 
   	M = atoi(argv[1]);
+	M_gpu = M;
 	N = atoi(argv[2]);
+	N_gpu = N;
 	modeling_time = atof(argv[3]);
-	//rows_per_proc = M / total;
+
+	dim3 block_shape = dim3(32, 32);
+	dim3 grid_shape = dim3(max(1.0, ceil((float) M / (float) block_shape.x )),
+						   max(1.0, ceil((float) M / (float) block_shape.y )));
+
 	bot_row = 0;
 	top_row = M; // индекс верхней строки + 1 
 	printf("bot_row - %d, top_row - %d\n", bot_row, top_row);
@@ -59,19 +68,21 @@ int main(int argc, char* argv[]){
 		return -1;
 	}
 	 
-	omp_set_num_threads(atoi(argv[4]));
-
 	fp = fopen(FILE_NAME, "w+");
 	fclose(fp);
 
-	 config_plot(M, N, (double)modeling_time / (double)TIME_STEP + 1 );
+
+	config_plot(M, N, (double)modeling_time / (double)TIME_STEP + 1 );
 
 
 	matrix_1 = (double*) calloc(M * N, sizeof(double));
 	matrix_2 = (double*) calloc(M * N, sizeof(double));
-	sending_new = (double*) calloc(N * rows_per_proc, sizeof(double));
 	old = matrix_2;
 	new_layer = matrix_1; 
+
+	// Allocating space for the arrays on the gpu.
+	cudaMalloc((void **) &new_layer_gpu, N * sizeof(double));
+	cudaMalloc((void **) &old_gpu, N * sizeof(double));
 
 
 	// инициализация нулевого момента времени, выенесение информации на диск и переход к след слою 
@@ -92,7 +103,7 @@ int main(int argc, char* argv[]){
 	printf("my rank before cycle %d\n", myrank);
 
 	MPI_Barrier(MPI_COMM_WORLD); */
-	clock_t tStart = clock();
+	cudaEventRecord(start, 0);
 	while (cur_time < modeling_time){
 		// расчёт значений для нового временного слоя
 		 // нижняя грань
@@ -123,60 +134,78 @@ int main(int argc, char* argv[]){
 		}
 		new_layer[(M-1) * N] = new_layer[M*N -1] = U0;
 		top_row--;
-		#pragma omp parallel for private(j)
-		for (int i = bot_row; i < top_row; i++ ){
-			for (j = 0; j < N; j++){
-				if (j == 0) // лево
-				{
-					new_layer[N * i + j] = (old[N * i + (j-1)] +  // U_down
-						old[N * (i+1) + j] +   // U_right
-						old[N * i + (j+1)] -   // U_top
-						3* old[N * i + j])* my_perfect_const + old[N * i + j];
-				}
-				if (j == N-1) // право
-				{
-					new_layer[N * i + j] = (old[N * (i-1) + j] +	// U_left
-						old[N * i + (j-1)] + 	// U_down
-						old[N * i + (j+1)] -   // U_top
-						3* old[N * i + j])* my_perfect_const + old[N * i + j];
-				} // centr
-				if ( j != 0 && j != N-1 && i != 0 && i != M -1){
-					new_layer[N * i + j] = (old[N * i + (j-1)] +  // U_left
-						old[N * (i-1) + j] + 	// U_down
-						old[N * i + (j+1)] +  // U_right
-						old[N * (i+1) + j] -  // U_top
-						4* old[N * i + j])* my_perfect_const + old[N * i + j];
-				}
-			}
-		}
+
+		// bot_row, top_row, new_layer, old, my_perfect_const, N, M
+		// int: bot_row, top_row, N, M.
+		// double *: new_layer, old. 
+		cudaMemcpy(new_layer_gpu, new_layer, N * sizeof(double), cudaMemcpyHostToDevice);
+		cudaMemcpy(old_gpu, old, N * sizeof(double), cudaMemcpyHostToDevice);
+
+		calculate_new_step<<<grid_shape, block_shape>>>(old_gpu, new_layer_gpu, N_gpu, M_gpu);
 		
+		cudaMemcpy(new_layer, new_layer_gpu, N * sizeof(double), cudaMemcpyDeviceToHost);
+		cudaMemcpy(old, old_gpu, N * sizeof(double), cudaMemcpyDeviceToHost);
 
 		new_layer[0] = new_layer[N-1] = new_layer[(M-1) * N] = new_layer[M*N -1] = U0;
-		// вынесение значений на жёсткий диск
-		// new_to_all();
-		for (i = bot_row; i < top_row; i++ ){
-			for (j = 0; j < N; j++){
-				sending_new[(i - bot_row) * N + j] = new_layer[N * i + j];
-			}
-		}
-		
-		
-		
-		double * ptr = &new_layer[bot_row * N];
 
+		// вынесение значений на жёсткий диск
 		// data_to_file(old, M, N);
 
- 
 		tmp = old;
 		old = new_layer;
 		new_layer = tmp; 
 		cur_time = cur_time + TIME_STEP; 
 	} 
-	printf("Time taken: %.2fs\n", (double)(clock() - tStart)/CLOCKS_PER_SEC);
-    exit(0);
+	cudaEventRecord(stop, 0);
+	cudaEventSynchronize(stop);
+
+	cudaEventElapsedTime(&GPUTime, start, stop);
+	printf("GPU time: %.3f ms\n", GPUTime);
+
+	cudaEventDestroy(start);
+	cudaEventDestroy(stop);
+
+	free(new_layer);
+	free(old);
+
+	cudaFree(new_layer_gpu);
+	cudaFree(old_gpu);
+
+
+    return 0;
 }
 
+__global__ void calculate_new_step(double* old_layer, double* new_layer, const int N, int M){
+	double my_perfect_const = TIME_STEP / (R * C);
 
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (i < M) {
+		for (int j = 0; j < N; j++){
+			if (j == 0) // лево
+			{
+				new_layer[N * i + j] = (old_layer[N * i + (j-1)] +  // U_down
+					old_layer[N * (i+1) + j] +   // U_right
+					old_layer[N * i + (j+1)] -   // U_top
+					3* old_layer[N * i + j])* my_perfect_const + old_layer[N * i + j];
+			}
+			if (j == N-1) // право
+			{
+				new_layer[N * i + j] = (old_layer[N * (i-1) + j] +	// U_left
+					old_layer[N * i + (j-1)] + 	// U_down
+					old_layer[N * i + (j+1)] -   // U_top
+					3* old_layer[N * i + j])* my_perfect_const + old_layer[N * i + j];
+			} // centr
+			if ( j != 0 && j != N-1 && i != 0 && i != M -1){
+				new_layer[N * i + j] = (old_layer[N * i + (j-1)] +  // U_left
+					old_layer[N * (i-1) + j] + 	// U_down
+					old_layer[N * i + (j+1)] +  // U_right
+					old_layer[N * (i+1) + j] -  // U_top
+					4* old_layer[N * i + j])* my_perfect_const + old_layer[N * i + j];
+			}
+		}
+	}
+}
 
 void data_to_file(double* matrix, int M, int N){
 	int i = 0;

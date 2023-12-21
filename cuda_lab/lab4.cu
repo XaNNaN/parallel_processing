@@ -34,9 +34,15 @@ int main(int argc, char* argv[]){
 	double *new_layer_gpu, *old_gpu;
 	double my_perfect_const = TIME_STEP / (R * C);
 	int bot_row, top_row;
+	
 
 	cudaEvent_t start, stop;
 	float GPUTime = 0.0f;
+
+
+
+
+	
 
 	cudaEventCreate(&start);
 	cudaEventCreate(&stop);
@@ -55,9 +61,26 @@ int main(int argc, char* argv[]){
 	N_gpu = N;
 	modeling_time = atof(argv[3]);
 
+	int N_threads = 512;
+	int N_blocks;
+
+	if ( (M * N % N_threads) == 0 )
+		N_blocks = ( M  / N_threads);
+	else
+		N_blocks = ( M  / N_threads) + 1;
+
+	dim3 Threads(N_threads);
+	dim3 Blocks(N_blocks);
+
 	dim3 block_shape = dim3(32, 32);
 	dim3 grid_shape = dim3(max(1.0, ceil((float) M / (float) block_shape.x )),
 						   max(1.0, ceil((float) M / (float) block_shape.y )));
+
+	printf("Grid shape: %d %d\n", grid_shape.x, grid_shape.y);
+	printf("Grid shape: %d %d\n", block_shape.x, block_shape.y);
+
+	printf("Threads: %d\n", Threads.x);
+	printf("Blocks: %d\n", Blocks.x);
 
 	bot_row = 0;
 	top_row = M; // индекс верхней строки + 1 
@@ -79,10 +102,11 @@ int main(int argc, char* argv[]){
 	matrix_2 = (double*) calloc(M * N, sizeof(double));
 	old = matrix_2;
 	new_layer = matrix_1; 
+	
 
 	// Allocating space for the arrays on the gpu.
-	cudaMalloc((void **) &new_layer_gpu, N * sizeof(double));
-	cudaMalloc((void **) &old_gpu, N * sizeof(double));
+	cudaMalloc((void **) &new_layer_gpu, N * M * sizeof(double));
+	cudaMalloc((void **) &old_gpu, N * M * sizeof(double));
 
 
 	// инициализация нулевого момента времени, выенесение информации на диск и переход к след слою 
@@ -138,18 +162,18 @@ int main(int argc, char* argv[]){
 		// bot_row, top_row, new_layer, old, my_perfect_const, N, M
 		// int: bot_row, top_row, N, M.
 		// double *: new_layer, old. 
-		cudaMemcpy(new_layer_gpu, new_layer, N * sizeof(double), cudaMemcpyHostToDevice);
-		cudaMemcpy(old_gpu, old, N * sizeof(double), cudaMemcpyHostToDevice);
+		cudaMemcpy(new_layer_gpu, new_layer, N * M *sizeof(double), cudaMemcpyHostToDevice);
+		cudaMemcpy(old_gpu, old, N * M * sizeof(double), cudaMemcpyHostToDevice);
 
-		calculate_new_step<<<grid_shape, block_shape>>>(old_gpu, new_layer_gpu, N_gpu, M_gpu);
+		calculate_new_step<<<Blocks, Threads>>>(old_gpu, new_layer_gpu, N_gpu, M_gpu);
 		
-		cudaMemcpy(new_layer, new_layer_gpu, N * sizeof(double), cudaMemcpyDeviceToHost);
-		cudaMemcpy(old, old_gpu, N * sizeof(double), cudaMemcpyDeviceToHost);
+		cudaMemcpy(new_layer, new_layer_gpu, N * M * sizeof(double), cudaMemcpyDeviceToHost);
+		cudaMemcpy(old, old_gpu, N * M * sizeof(double), cudaMemcpyDeviceToHost);
 
 		new_layer[0] = new_layer[N-1] = new_layer[(M-1) * N] = new_layer[M*N -1] = U0;
 
 		// вынесение значений на жёсткий диск
-		// data_to_file(old, M, N);
+		data_to_file(old, M, N);
 
 		tmp = old;
 		old = new_layer;
@@ -160,7 +184,7 @@ int main(int argc, char* argv[]){
 	cudaEventSynchronize(stop);
 
 	cudaEventElapsedTime(&GPUTime, start, stop);
-	printf("GPU time: %.3f ms\n", GPUTime);
+	printf("GPU time: %.3f ms or %.0f s\n", GPUTime, GPUTime/1000);
 
 	cudaEventDestroy(start);
 	cudaEventDestroy(stop);
@@ -179,6 +203,9 @@ __global__ void calculate_new_step(double* old_layer, double* new_layer, const i
 	double my_perfect_const = TIME_STEP / (R * C);
 
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	// int j = blockIdx.y * blockDim.y + threadIdx.y;
+	// i = threadIdx.y;
+	// printf("%d\n", i);
 
 	if (i < M) {
 		for (int j = 0; j < N; j++){
@@ -188,6 +215,7 @@ __global__ void calculate_new_step(double* old_layer, double* new_layer, const i
 					old_layer[N * (i+1) + j] +   // U_right
 					old_layer[N * i + (j+1)] -   // U_top
 					3* old_layer[N * i + j])* my_perfect_const + old_layer[N * i + j];
+				
 			}
 			if (j == N-1) // право
 			{
